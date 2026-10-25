@@ -1,0 +1,28 @@
+# 机器相关，不入库（路径里含本机用户名）
+.claude/hooks.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 数据库与备份
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.bak-*
+*_probe.yml
+
+# 本机其它工作，不属于本仓库
+logs/
+steps/
+ocs-setup/
+ncm_tool/
+*.png
+*.docx
+*.xlsx
+*.rds
+*.R
+*.RData
+*.Rhistory
+~$*
