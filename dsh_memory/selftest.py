@@ -442,6 +442,64 @@ def main() -> int:
     weak = st3.recall("ThinkPad", limit=8)
     check(any(h["id"] == old for h in weak), "弱命中时兜底翻出 faded")
 
+    # ---- 回归：faded 粗筛（2026-10-27 加）----
+    from core import tokenize as _tok
+
+    calls: list[int] = []
+    _orig = st3._fetch_faded
+
+    def _spy(*a, **k):
+        calls.append(1)
+        return _orig(*a, **k)
+
+    st3._fetch_faded = _spy
+    st3.recall("", limit=6)
+    check(not calls, "空查询不触发 faded 兜底")
+    st3.recall("ThinkPad", limit=8)
+    check(bool(calls), "非空弱查询仍会触发兜底")
+    st3._fetch_faded = _orig
+
+    _q = "ThinkPad"
+    _qt = _tok(_q)
+    _full = st3._pass(st3._fetch(("faded",), "", ""), st3._tf(_qt), _qt, 8, "", False)
+    _pre = st3._pass(
+        st3._fetch_faded(_qt, "", ""), st3._tf(_qt), _qt, 8, "", False,
+        *st3._faded_corpus_stats(_qt),
+    )
+    check([x["id"] for x in _full] == [x["id"] for x in _pre], "粗筛与全扫的排序结果一致")
+
+    esc = Store(str(Path(tempfile.mkdtemp()) / "esc.db"))
+    esc.remember("dsh_memory 的配置放在 dsh 目录", kind="fact", importance=0.5)
+    decoy = esc.remember("dshXmemory 是诱饵条目", kind="fact", importance=0.5)["id"]
+    esc.db.execute("UPDATE memories SET status='faded'")
+    esc.db.commit()
+    _hit_ids = [r["id"] for r in esc._fetch_faded(_tok("dsh_memory"), "", "")]
+    check(decoy not in _hit_ids, "LIKE 里的下划线被转义（不误伤 dshXmemory）")
+
+    # ---- 回归：兜底保底（强相关 faded 不被无关活跃条目挤掉）----
+    rs = Store(str(Path(tempfile.mkdtemp()) / "rescue.db"))
+    for i in range(8):
+        rs.remember(f"第{i}条完全无关的日常记录，讲的是{i}号琐事", kind="fact", importance=0.85)
+    target = rs.remember("zenbookx1 的驱动版本锁定在 5.1.3", kind="fact", importance=0.5)["id"]
+    rs.db.execute("UPDATE memories SET status='faded' WHERE id=?", (target,))
+    rs.db.commit()
+    got = rs.recall("zenbookx1", limit=8, reinforce=False)
+    check(any(h["id"] == target for h in got), "强相关的 faded 命中不会被无关活跃条目挤掉")
+
+    # 反面：保底有上限，不会让 faded 把结果淹了
+    rs2 = Store(str(Path(tempfile.mkdtemp()) / "rescue2.db"))
+    for i in range(8):
+        rs2.remember(f"第{i}条无关记录，讲的是{i}号琐事", kind="fact", importance=0.85)
+    many = []
+    for name in ("zenbookx1 的驱动是 5.1.3", "zenbookx1 装过两次", "zenbookx1 在旧机器上"):
+        mid = rs2.remember(name, kind="fact", importance=0.4)["id"]
+        many.append(mid)
+    for mid in many:
+        rs2.db.execute("UPDATE memories SET status='faded' WHERE id=?", (mid,))
+    rs2.db.commit()
+    got2 = [h for h in rs2.recall("zenbookx1", limit=8, reinforce=False) if h["id"] in many]
+    check(len(got2) == 2, f"保底最多放 2 条 faded（实得 {len(got2)}）")
+
     # ---- 老库迁移 ----
     print("\n── 老库迁移 ──")
     import sqlite3 as _sq

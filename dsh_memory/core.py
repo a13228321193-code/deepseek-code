@@ -45,6 +45,9 @@ SHORT_MAX_ACTIVE_DAYS = 3  # 短期条目的活跃日寿命上限（超过直接
 SHORT_IN_PACK = 8          # 开场包里给全文的短期条数；更早的只汇总成一行
 PROMOTE_USE_COUNT = 3      # 被提及这么多次就晋升，不看当时权重
 FADED_FALLBACK_REL = 0.15  # 主检索的最好成绩低于此值，才去翻 faded 兜底
+FADED_PREFILTER_TOKENS = 8   # faded 兜底粗筛最多用几个 token（每个 token 一遍全表扫描，别贪多）
+FADED_RESCUE_MIN_REL = 0.15  # 兜底命中相关度到这一档，才允许挤掉活跃条目
+FADED_RESCUE_MAX = 2         # 一次兜底最多保底放进几条 faded
 HARD_DELETE_DAYS = 180     # faded 且从未再被用到，超过此天数才物理删除
 REINFORCE = 0.15           # 每次命中加权的幅度
 REINFORCE_MIN_REL = 0.10   # 相关度低于此值：只是被"顺带捞出来"，不算想起来，不加权
@@ -126,6 +129,12 @@ def tokenize(text: str) -> list[str]:
         out.extend(run)
         out.extend(run[i : i + 2] for i in range(len(run) - 1))
     return out
+
+
+def _like_escape(text: str) -> str:
+    """转义 LIKE 的通配符。英文 token 里会出现下划线（如 dsh_memory），
+    不转义的话 '_' 会匹配任意单字符，粗筛结果就不可信了。"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _now() -> float:
@@ -517,6 +526,84 @@ class Store:
         nb = math.sqrt(sum(v * v for v in dv.values()))
         return dot / (na * nb) if na and nb else 0.0
 
+    @staticmethod
+    def _faded_tokens(qt: list[str]) -> list[str]:
+        """粗筛和全池统计必须用同一批 token，否则 idf 与候选集对不上。
+
+        单字（尤其中文）选择性太差 —— 一个「的」能把大半个库捞出来，等于没筛。
+        所以优先只留二字组/英文词；整条查询都是单字时才退回单字。
+        """
+        toks = list(dict.fromkeys(qt))
+        strong = [t for t in toks if len(t) >= 2]
+        return (strong or toks)[:FADED_PREFILTER_TOKENS]
+
+    def _faded_corpus_stats(self, qt: list[str]) -> tuple[dict[str, float], float]:
+        """在整个 faded 池上算 df/idf，供粗筛后的打分使用。
+
+        为什么要单独算：_pass 默认用「候选集内」的 IDF。粗筛把候选集从 2 万缩到几条，
+        IDF 会退化成全相等，长文档的余弦被稀释 —— 实测本该排第一的 faded 条目会掉出前八。
+        这里用一条 SQL 在全池上数文档频率，得到的 idf 与「全扫」时逐字一致，
+        粗筛于是只减少参与打分的行数，不改变分数。
+        """
+        toks = self._faded_tokens(qt)
+        if not toks:
+            return {}, 1.0
+        cols = ", ".join(
+            ["COUNT(*)"]
+            + [
+                "SUM(CASE WHEN (text || ' ' || tags) LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)"
+                for _ in toks
+            ]
+        )
+        args = [f"%{_like_escape(t)}%" for t in toks]
+        row = self.db.execute(
+            f"SELECT {cols} FROM memories WHERE status='faded'", args
+        ).fetchone()
+        n = int(row[0] or 0)
+        if n == 0:
+            return {}, 1.0
+        unseen = math.log(n + 1) + 1.0
+        # df 为 0 的 token 不放进 idf：_cos_idf 会用 unseen 兜底，和全扫时的行为一致。
+        idf = {
+            t: math.log((n + 1) / (int(row[i + 1] or 0) + 0.5)) + 1.0
+            for i, t in enumerate(toks)
+            if int(row[i + 1] or 0) > 0
+        }
+        return idf, unseen
+
+    def _fetch_faded(self, qt: list[str], kind: str, topic: str) -> list[sqlite3.Row]:
+        """faded 兜底候选：先用 SQL 粗筛，再交给 _pass 打分。
+
+        全扫的成本不在 SQL，而在 Python —— 每条都要 tokenize + 算余弦，2 万条 faded
+        实测 1.1 秒。SQL 的 LIKE 在 C 里跑，同样的数据十几毫秒。
+
+        粗筛条件是「任一 token 命中 text 或 tags」，它是 relevance>0 的超集，
+        不会漏掉本该命中的条目，只会少算一批注定得 0 分的。
+        """
+        where = ["status='faded'"]
+        args: list = []
+        if kind:
+            where.append("kind=?")
+            args.append(kind)
+        if topic:
+            # 带 topic 时 _pass 会给 rel==0 的条目标 0.12 底分（见 _pass），
+            # 粗筛会改掉这个行为；而 topic 本身已经把候选集缩小了，这条路保持全扫。
+            where.append("topic=?")
+            args.append(topic)
+            return self.db.execute(
+                f"SELECT * FROM memories WHERE {' AND '.join(where)}", args
+            ).fetchall()
+
+        toks = self._faded_tokens(qt)
+        if not toks:
+            return []
+        clause = " OR ".join(["(text || ' ' || tags) LIKE ? ESCAPE '\\'"] * len(toks))
+        args.extend(f"%{_like_escape(t)}%" for t in toks)
+        where.append(f"({clause})")
+        return self.db.execute(
+            f"SELECT * FROM memories WHERE {' AND '.join(where)}", args
+        ).fetchall()
+
     def _fetch(self, statuses: tuple[str, ...], kind: str, topic: str) -> list[sqlite3.Row]:
         where = [f"status IN ({','.join('?' * len(statuses))})"]
         args: list = list(statuses)
@@ -561,14 +648,21 @@ class Store:
         limit: int,
         topic: str,
         reinforce: bool,
+        idf: dict[str, float] | None = None,
+        unseen: float | None = None,
     ) -> list[dict]:
-        """对一批候选打分。候选集大小直接决定耗时，所以调用方要控制它。"""
+        """对一批候选打分。候选集大小直接决定耗时，所以调用方要控制它。
+
+        idf / unseen 传了就按传入的算（faded 粗筛用全池统计，避免缩小候选集后
+        IDF 退化、把长文档的相关度稀释掉）；不传则维持原来的「候选集内算 IDF」。
+        """
         if not rows:
             return []
-        # 只在候选集内算 IDF：不管全库有多少条，成本只跟这批有关。
         tfs = {r["id"]: self._tf(tokenize(r["text"] + " " + r["tags"])) for r in rows}
-        idf = self._idf(list(tfs.values()))
-        unseen = math.log(len(rows) + 1) + 1.0
+        if idf is None:
+            idf = self._idf(list(tfs.values()))
+        if unseen is None:
+            unseen = math.log(len(rows) + 1) + 1.0
 
         scored = []
         for r in rows:
@@ -676,17 +770,50 @@ class Store:
         # 兜底：主检索没打中（不是"没有结果"，是"结果都很弱"），才去翻 faded。
         # 用"最好成绩"判断而不是"有没有结果"，否则只要库里有几条活跃条目，
         # 一条弱匹配就会挡住所有已经淡忘的记忆。
-        if not include_faded:
+        #
+        # 空查询不兜底：开场包那种 qt 为空的调用，相关度恒为 0，必然触发一次全库
+        # faded 扫描（实测 2 万条 faded 要 344ms，每个新会话都付）。而且开场包本来
+        # 就不该带 faded 条目 —— 那是"已经淡忘的东西"。
+        if not include_faded and qt:
             best = max((x["relevance"] for x in out), default=0.0)
             if best < FADED_FALLBACK_REL:
+                faded_rows = self._fetch_faded(qt, kind, topic)
+                if faded_rows and not kind and not topic:
+                    # 粗筛缩小了候选集，IDF 必须仍按整个 faded 池算，否则分数会偏。
+                    idf, unseen = self._faded_corpus_stats(qt)
+                else:
+                    idf = unseen = None
                 extra = self._pass(
-                    self._fetch(("faded",), kind, topic), qt_tf, qt, limit, topic, reinforce
+                    faded_rows, qt_tf, qt, limit, topic, reinforce, idf=idf, unseen=unseen
                 )
                 if extra:
                     seen = {x["id"] for x in out}
-                    out += [e for e in extra if e["id"] not in seen]
+                    added = [e for e in extra if e["id"] not in seen]
+                    out += added
                     out.sort(key=lambda x: x["score"], reverse=True)
-                    out = out[: max(1, min(limit, 30))]
+                    cap = max(1, min(limit, 30))
+                    out = out[:cap]
+
+                    # 保底：faded 条目分数要乘 0.55 的淡忘系数，而"无关但权重高"的
+                    # 活跃条目动辄 0.27 分。只按总分截断的话，一条 relevance 0.25 的
+                    # 老记忆会被八条 relevance 0 的活跃条目整批挤掉 —— 兜底等于白做。
+                    # 规则：命中足够相关（≥ FADED_RESCUE_MIN_REL）且比被替换的那条
+                    # 更相关时，才占一个名额；这样不会把真正相关度更高的活跃条目挤走。
+                    kept = {x["id"] for x in out}
+                    dropped = sorted(
+                        (
+                            e
+                            for e in added
+                            if e["id"] not in kept and e["relevance"] >= FADED_RESCUE_MIN_REL
+                        ),
+                        key=lambda x: x["relevance"],
+                        reverse=True,
+                    )[: max(1, min(FADED_RESCUE_MAX, cap // 4))]
+                    for e in dropped:
+                        victim = min(out, key=lambda x: x["relevance"])
+                        if victim["relevance"] < e["relevance"]:
+                            out[out.index(victim)] = e
+                    out.sort(key=lambda x: x["score"], reverse=True)
 
         self.db.commit()
         return out
