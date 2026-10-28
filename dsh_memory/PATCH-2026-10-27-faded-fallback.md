@@ -1,5 +1,9 @@
 # 补丁 2026-10-27：faded 兜底提速 + 保底
 
+> **已被 2026-10-28 的倒排索引取代**（见 `PATCH-2026-10-28-token-index.md`）：
+> 本文的 LIKE 粗筛、`_fetch_faded`、`_faded_tokens` 已删除；空查询不兜底与保底逻辑保留。
+> 保留本文的原因：它记录了当初的实测与两个坑，正是这次换结构的依据。
+
 > 改动文件：`core.py`（`recall` / `_pass` / 新增 `_fetch_faded` `_faded_corpus_stats` `_faded_tokens`）、
 > `selftest.py`（新增 6 项回归）。
 > 备份：`core.py.bak-before-faded-fix`（本补丁第一版前）、`core.py.bak-before-faded-rescue`（保底前）。

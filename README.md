@@ -390,6 +390,17 @@ ctx.on("agent/turn-stopping", async ({ agent, turn, signal }) => {
 规则：主检索的**最好成绩** `relevance < 0.15` 时，才去翻 `faded` 兜底一次。
 用"最好成绩"而不是"有没有结果"判断 —— 否则库里只要有几条活跃条目，一条弱匹配就会挡住所有淡忘的记忆。
 
+`faded` 的兜底查询本身走**倒排索引**（2026-10-28 加）：`mem_tokens` 存 faded 条目的
+token/tf，`token_df` 存 df，只索引 `faded`（活跃条目有 300 条上限，全扫更便宜）。
+两张表都是派生数据，数量对不上会自动整表重建 —— 删掉也不丢任何记忆。
+
+- 好处：df 直接从索引读，IDF 与全扫逐位一致；候选只取命中查询词的条目。
+  合成数据实测 20,000 条 faded 时一次弱查询 **6 ms**（全扫 1.0 s）。
+- 代价：老库首次要扫一遍 faded 建索引（20,000 条约 7.9 s、115 万行；真实库 45 条可忽略）。
+- 取候选时单字不参与（选择性太差）；全是高频词的长查询按 df 从小到大取到预算为止。
+  被丢掉的都是「被高频词命中」的条目，IDF 权重本来就低。`relevance = 0` 的条目也不再进候选
+  —— 全扫会按权重把它们排进前八，实测能占掉一半名额。
+
 `faded` 的条目总分乘 0.55。`query` 留空 = 返回「开场包」：全部 `profile` + 权重最高的 6 条 `fact`
 + 权重最高的 2 条 `decision` + **最新的 3 条 `short`**（按时间，不按权重）。
 
@@ -438,6 +449,10 @@ REINFORCE = 0.15           # 每次命中的加权幅度
 REINFORCE_MIN_REL = 0.10   # 低于这个相关度不算"想起来"，不加权
 PROMOTE_USE_COUNT = 3      # 短期被提及这么多次 -> 晋升为 event
 ZOMBIE_DAYS = 30           # short 的墙钟兜底
+FADED_FALLBACK_REL = 0.15  # 主检索最好成绩低于此值才翻 faded
+FADED_RESCUE_MIN_REL = 0.15  # 兜底命中相关度到这一档才允许挤掉活跃条目
+FADED_RESCUE_MAX = 2         # 一次兜底最多保底几条 faded
+FADED_CANDIDATE_BUDGET = 2000  # 兜底候选上限（token 按 df 从小到大取，累计超过就停）
 CONSOLIDATE_INTERVAL = 12 * 3600
 ```
 

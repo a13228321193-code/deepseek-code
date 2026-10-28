@@ -45,7 +45,7 @@ SHORT_MAX_ACTIVE_DAYS = 3  # 短期条目的活跃日寿命上限（超过直接
 SHORT_IN_PACK = 8          # 开场包里给全文的短期条数；更早的只汇总成一行
 PROMOTE_USE_COUNT = 3      # 被提及这么多次就晋升，不看当时权重
 FADED_FALLBACK_REL = 0.15  # 主检索的最好成绩低于此值，才去翻 faded 兜底
-FADED_PREFILTER_TOKENS = 8   # faded 兜底粗筛最多用几个 token（每个 token 一遍全表扫描，别贪多）
+FADED_CANDIDATE_BUDGET = 2000  # 兜底候选上限：按 df 从小到大取 token，累计命中数超此值就停
 FADED_RESCUE_MIN_REL = 0.15  # 兜底命中相关度到这一档，才允许挤掉活跃条目
 FADED_RESCUE_MAX = 2         # 一次兜底最多保底放进几条 faded
 HARD_DELETE_DAYS = 180     # faded 且从未再被用到，超过此天数才物理删除
@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_mem_kind   ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+-- faded 兜底的倒排索引。只索引 status='faded' 的条目：活跃条目 ≤ MAX_ACTIVE 条，
+-- 直接全扫比维护索引便宜。索引是派生数据，任何时候都能从 memories 重建。
+CREATE TABLE IF NOT EXISTS mem_tokens (
+    memory_id INTEGER NOT NULL,
+    token     TEXT NOT NULL,
+    tf        INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, token)
+);
+CREATE INDEX IF NOT EXISTS idx_tok_token ON mem_tokens(token);
+CREATE TABLE IF NOT EXISTS token_df (
+    token TEXT PRIMARY KEY,
+    df    INTEGER NOT NULL
+);
 """
 
 # 依赖后加列的索引，必须等 _migrate() 补完列再建 ——
@@ -129,12 +142,6 @@ def tokenize(text: str) -> list[str]:
         out.extend(run)
         out.extend(run[i : i + 2] for i in range(len(run) - 1))
     return out
-
-
-def _like_escape(text: str) -> str:
-    """转义 LIKE 的通配符。英文 token 里会出现下划线（如 dsh_memory），
-    不转义的话 '_' 会匹配任意单字符，粗筛结果就不可信了。"""
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _now() -> float:
@@ -255,6 +262,8 @@ class Store:
         # 列补齐之后才能建依赖它们的索引
         for sql in POST_MIGRATE_SQL:
             self.db.execute(sql)
+        # 倒排索引是派生数据：对不上就整表重建。老库第一次用新代码也走这里。
+        self._verify_token_index()
 
     # ---------------- 基础 ----------------
 
@@ -526,82 +535,208 @@ class Store:
         nb = math.sqrt(sum(v * v for v in dv.values()))
         return dot / (na * nb) if na and nb else 0.0
 
-    @staticmethod
-    def _faded_tokens(qt: list[str]) -> list[str]:
-        """粗筛和全池统计必须用同一批 token，否则 idf 与候选集对不上。
+    # ---------------- faded 倒排索引 ----------------
+    # 兜底检索需要「整个 faded 池」的 df/idf，但不需要每次 tokenize 全池。所以把
+    # faded 条目的 token 与 tf 存成索引，df 另存一张计数表。只索引 faded：
+    # 活跃条目有 MAX_ACTIVE 上限，全扫本来就便宜。
+    # 索引是派生数据 —— 任何不一致都能从 memories 整表重建，不会丢东西。
 
-        单字（尤其中文）选择性太差 —— 一个「的」能把大半个库捞出来，等于没筛。
-        所以优先只留二字组/英文词；整条查询都是单字时才退回单字。
-        """
-        toks = list(dict.fromkeys(qt))
-        strong = [t for t in toks if len(t) >= 2]
-        return (strong or toks)[:FADED_PREFILTER_TOKENS]
-
-    def _faded_corpus_stats(self, qt: list[str]) -> tuple[dict[str, float], float]:
-        """在整个 faded 池上算 df/idf，供粗筛后的打分使用。
-
-        为什么要单独算：_pass 默认用「候选集内」的 IDF。粗筛把候选集从 2 万缩到几条，
-        IDF 会退化成全相等，长文档的余弦被稀释 —— 实测本该排第一的 faded 条目会掉出前八。
-        这里用一条 SQL 在全池上数文档频率，得到的 idf 与「全扫」时逐字一致，
-        粗筛于是只减少参与打分的行数，不改变分数。
-        """
-        toks = self._faded_tokens(qt)
-        if not toks:
-            return {}, 1.0
-        cols = ", ".join(
-            ["COUNT(*)"]
-            + [
-                "SUM(CASE WHEN (text || ' ' || tags) LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)"
-                for _ in toks
-            ]
+    def _index_add(self, memory_id: int, text: str, tags: str) -> None:
+        tfs = self._tf(tokenize(text + " " + tags))
+        if not tfs:
+            return
+        self.db.executemany(
+            "INSERT OR REPLACE INTO mem_tokens(memory_id,token,tf) VALUES (?,?,?)",
+            [(memory_id, t, c) for t, c in tfs.items()],
         )
-        args = [f"%{_like_escape(t)}%" for t in toks]
-        row = self.db.execute(
-            f"SELECT {cols} FROM memories WHERE status='faded'", args
+        self.db.executemany(
+            "INSERT INTO token_df(token,df) VALUES (?,1) "
+            "ON CONFLICT(token) DO UPDATE SET df=df+1",
+            [(t,) for t in tfs],
+        )
+
+    def _index_remove(self, memory_id: int) -> None:
+        toks = [
+            r["token"]
+            for r in self.db.execute(
+                "SELECT token FROM mem_tokens WHERE memory_id=?", (memory_id,)
+            )
+        ]
+        if not toks:
+            return
+        self.db.execute("DELETE FROM mem_tokens WHERE memory_id=?", (memory_id,))
+        self.db.executemany(
+            "UPDATE token_df SET df=df-1 WHERE token=?", [(t,) for t in toks]
+        )
+
+    def _prune_token_df(self) -> None:
+        """清掉 df 归零的 token。不影响正确性（查询都按 df>0 过滤），只是别让词表无限攒。"""
+        self.db.execute("DELETE FROM token_df WHERE df<=0")
+
+    def _reindex(self, memory_id: int) -> None:
+        """改过 text/tags 或 status 之后调一次。索引只收 faded，离开 faded 等于只删不加。"""
+        had = self.db.execute(
+            "SELECT 1 FROM mem_tokens WHERE memory_id=? LIMIT 1", (memory_id,)
         ).fetchone()
-        n = int(row[0] or 0)
+        self._index_remove(memory_id)
+        row = self.db.execute(
+            "SELECT id,text,tags,status FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        now = bool(row and row["status"] == "faded")
+        if now:
+            self._index_add(row["id"], row["text"], row["tags"])
+        delta = int(now) - int(bool(had))
+        if delta:
+            self._bump_index_docs(delta)
+
+    def _bump_index_docs(self, delta: int) -> None:
+        """按差值维护「索引收了多少个 faded 文档」，避免每次重新 COUNT。"""
+        cur = int(self._meta("token_index_docs", "0") or 0)
+        n = max(0, cur + delta)
+        self.db.execute(
+            "INSERT INTO meta(k,v) VALUES ('token_index_docs',?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (str(n),),
+        )
+
+    def _sync_index_meta(self) -> None:
+        """记下「索引收了多少个 faded 文档」，_verify_token_index 拿它做廉价体检。"""
+        n = self.db.execute(
+            "SELECT COUNT(*) FROM memories WHERE status='faded'"
+        ).fetchone()[0]
+        self.db.execute(
+            "INSERT INTO meta(k,v) VALUES ('token_index_docs',?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (str(n),),
+        )
+
+    def _rebuild_token_index(self) -> None:
+        self.db.execute("DELETE FROM mem_tokens")
+        self.db.execute("DELETE FROM token_df")
+        for r in self.db.execute("SELECT id,text,tags FROM memories WHERE status='faded'"):
+            self._index_add(r["id"], r["text"], r["tags"])
+        self._sync_index_meta()
+
+    def _verify_token_index(self, full: bool = False) -> None:
+        """体检：文档数对不上必重建；full=True 时再核行数（consolidate 里用）。"""
+        want = self.db.execute(
+            "SELECT COUNT(*) FROM memories WHERE status='faded'"
+        ).fetchone()[0]
+        have = int(self._meta("token_index_docs", "-1") or -1)
+        bad = have != want
+        if not bad and full:
+            rows = self.db.execute("SELECT COUNT(*) FROM mem_tokens").fetchone()[0]
+            df_sum = self.db.execute(
+                "SELECT COALESCE(SUM(df),0) FROM token_df"
+            ).fetchone()[0]
+            bad = rows != df_sum
+        if bad:
+            self._rebuild_token_index()
+
+    # ---------------- faded 兜底检索 ----------------
+
+    def _faded_corpus_stats(
+        self, qt: list[str], tfs: dict[int, dict[str, int]], kind: str
+    ) -> tuple[dict[str, float], float]:
+        """全 faded 池的 df/idf，df 从索引直接读，不再扫表。
+
+        这样算出的 idf 与「全扫」逐位相同 —— 候选可以只算几条，分数不变。
+        带 kind 时 df 必须同样收窄到该 kind，所以走一次命中索引的 join 统计。
+        """
+        tokens = list(dict.fromkeys(qt + [t for tf in tfs.values() for t in tf]))
+        if not tokens:
+            return {}, 1.0
+        ph = ",".join("?" * len(tokens))
+        if kind:
+            dfs = {
+                r["token"]: r["c"]
+                for r in self.db.execute(
+                    f"SELECT t.token, COUNT(*) c FROM mem_tokens t "
+                    f"JOIN memories m ON m.id=t.memory_id "
+                    f"WHERE t.token IN ({ph}) AND m.status='faded' AND m.kind=? "
+                    f"GROUP BY t.token",
+                    tokens + [kind],
+                )
+            }
+            n = self.db.execute(
+                "SELECT COUNT(*) FROM memories WHERE status='faded' AND kind=?", (kind,)
+            ).fetchone()[0]
+        else:
+            dfs = {
+                r["token"]: r["df"]
+                for r in self.db.execute(
+                    f"SELECT token, df FROM token_df WHERE token IN ({ph})", tokens
+                )
+            }
+            n = self.db.execute(
+                "SELECT COUNT(*) FROM memories WHERE status='faded'"
+            ).fetchone()[0]
         if n == 0:
             return {}, 1.0
         unseen = math.log(n + 1) + 1.0
         # df 为 0 的 token 不放进 idf：_cos_idf 会用 unseen 兜底，和全扫时的行为一致。
         idf = {
-            t: math.log((n + 1) / (int(row[i + 1] or 0) + 0.5)) + 1.0
-            for i, t in enumerate(toks)
-            if int(row[i + 1] or 0) > 0
+            t: math.log((n + 1) / (dfs[t] + 0.5)) + 1.0
+            for t in tokens
+            if dfs.get(t, 0) > 0
         }
         return idf, unseen
 
-    def _fetch_faded(self, qt: list[str], kind: str, topic: str) -> list[sqlite3.Row]:
-        """faded 兜底候选：先用 SQL 粗筛，再交给 _pass 打分。
+    def _faded_candidates(self, qt: list[str], kind: str, topic: str) -> list[sqlite3.Row]:
+        """兜底候选：走倒排索引取「命中任一 token」的 faded 条目。
 
-        全扫的成本不在 SQL，而在 Python —— 每条都要 tokenize + 算余弦，2 万条 faded
-        实测 1.1 秒。SQL 的 LIKE 在 C 里跑，同样的数据十几毫秒。
-
-        粗筛条件是「任一 token 命中 text 或 tags」，它是 relevance>0 的超集，
-        不会漏掉本该命中的条目，只会少算一批注定得 0 分的。
+        与全扫只差三处，都是有意的取舍：
+          * relevance=0 的条目不进候选 —— 全扫会按权重把它们排进前八，实测能占掉
+            一半名额，把真正命中的挤出去；
+          * 有二字组/英文词时单字不参与选候选 —— 选择性太差（一个「的」能捞大半
+            个库），单字命中的条目相关度本来就低；整条查询都是单字时才退回单字；
+          * 查询里全是高频词、累计命中超过 FADED_CANDIDATE_BUDGET 时，按 df 从
+            小到大只留一部分 token，丢掉的都是被高频词命中的条目。
+        留下的候选用全池 IDF 打分，相关度与全扫逐位相同。
         """
-        where = ["status='faded'"]
+        where = ["m.status='faded'"]
         args: list = []
         if kind:
-            where.append("kind=?")
+            where.append("m.kind=?")
             args.append(kind)
         if topic:
-            # 带 topic 时 _pass 会给 rel==0 的条目标 0.12 底分（见 _pass），
-            # 粗筛会改掉这个行为；而 topic 本身已经把候选集缩小了，这条路保持全扫。
-            where.append("topic=?")
+            # 带 topic 时 _pass 会给 rel==0 的条目标 0.12 底分，索引取候选会改掉
+            # 这个行为；topic 本身已经把候选集缩小了，这条路保持全扫。
+            where.append("m.topic=?")
             args.append(topic)
             return self.db.execute(
-                f"SELECT * FROM memories WHERE {' AND '.join(where)}", args
+                f"SELECT m.* FROM memories m WHERE {' AND '.join(where)}", args
             ).fetchall()
 
-        toks = self._faded_tokens(qt)
+        toks = [t for t in dict.fromkeys(qt) if len(t) >= 2] or list(dict.fromkeys(qt))
         if not toks:
             return []
-        clause = " OR ".join(["(text || ' ' || tags) LIKE ? ESCAPE '\\'"] * len(toks))
-        args.extend(f"%{_like_escape(t)}%" for t in toks)
-        where.append(f"({clause})")
+        ph = ",".join("?" * len(toks))
+        dfs = {
+            r["token"]: r["df"]
+            for r in self.db.execute(
+                f"SELECT token, df FROM token_df WHERE token IN ({ph})", toks
+            )
+        }
+        toks = [t for t in toks if dfs.get(t, 0) > 0]
+        if not toks:
+            return []
+        toks.sort(key=lambda t: dfs[t])  # 罕见的优先；预算不够时先丢高频词
+        chosen: list[str] = []
+        budget = FADED_CANDIDATE_BUDGET
+        for t in toks:
+            if chosen and dfs[t] > budget:
+                break
+            chosen.append(t)
+            budget -= dfs[t]
+        sub = (
+            "SELECT DISTINCT memory_id FROM mem_tokens "
+            f"WHERE token IN ({','.join('?' * len(chosen))})"
+        )
+        where.append(f"m.id IN ({sub})")
+        args.extend(chosen)
         return self.db.execute(
-            f"SELECT * FROM memories WHERE {' AND '.join(where)}", args
+            f"SELECT m.* FROM memories m WHERE {' AND '.join(where)}", args
         ).fetchall()
 
     def _fetch(self, statuses: tuple[str, ...], kind: str, topic: str) -> list[sqlite3.Row]:
@@ -650,15 +785,18 @@ class Store:
         reinforce: bool,
         idf: dict[str, float] | None = None,
         unseen: float | None = None,
+        tfs: dict[int, dict[str, int]] | None = None,
     ) -> list[dict]:
         """对一批候选打分。候选集大小直接决定耗时，所以调用方要控制它。
 
-        idf / unseen 传了就按传入的算（faded 粗筛用全池统计，避免缩小候选集后
+        idf / unseen 传了就按传入的算（faded 索引用全池统计，避免缩小候选集后
         IDF 退化、把长文档的相关度稀释掉）；不传则维持原来的「候选集内算 IDF」。
+        tfs 传了就复用调用方算好的词频 —— 兜底路径要用它同时算 df，别算两遍。
         """
         if not rows:
             return []
-        tfs = {r["id"]: self._tf(tokenize(r["text"] + " " + r["tags"])) for r in rows}
+        if tfs is None:
+            tfs = {r["id"]: self._tf(tokenize(r["text"] + " " + r["tags"])) for r in rows}
         if idf is None:
             idf = self._idf(list(tfs.values()))
         if unseen is None:
@@ -712,6 +850,7 @@ class Store:
                     revived_w = new_imp * self._decay(r["kind"], self._age_of(r))
                     if revived_w >= FADE_BELOW * 1.5:
                         self.db.execute("UPDATE memories SET status='active' WHERE id=?", (r["id"],))
+                        self._reindex(r["id"])  # 离开 faded，索引里要撤掉
             out.append(
                 {
                     "id": r["id"],
@@ -777,15 +916,22 @@ class Store:
         if not include_faded and qt:
             best = max((x["relevance"] for x in out), default=0.0)
             if best < FADED_FALLBACK_REL:
-                faded_rows = self._fetch_faded(qt, kind, topic)
-                if faded_rows and not kind and not topic:
-                    # 粗筛缩小了候选集，IDF 必须仍按整个 faded 池算，否则分数会偏。
-                    idf, unseen = self._faded_corpus_stats(qt)
-                else:
+                faded_rows = self._faded_candidates(qt, kind, topic)
+                extra: list[dict] = []
+                if faded_rows:
+                    # 词频只算一遍：df/idf 要用，打分也要用。
+                    tfs = {
+                        r["id"]: self._tf(tokenize(r["text"] + " " + r["tags"]))
+                        for r in faded_rows
+                    }
                     idf = unseen = None
-                extra = self._pass(
-                    faded_rows, qt_tf, qt, limit, topic, reinforce, idf=idf, unseen=unseen
-                )
+                    if not topic:
+                        # 索引取候选人，IDF 仍按整个 faded 池算，分数与全扫一致。
+                        idf, unseen = self._faded_corpus_stats(qt, tfs, kind)
+                    extra = self._pass(
+                        faded_rows, qt_tf, qt, limit, topic, reinforce,
+                        idf=idf, unseen=unseen, tfs=tfs,
+                    )
                 if extra:
                     seen = {x["id"] for x in out}
                     added = [e for e in extra if e["id"] not in seen]
@@ -814,6 +960,8 @@ class Store:
                         if victim["relevance"] < e["relevance"]:
                             out[out.index(victim)] = e
                     out.sort(key=lambda x: x["score"], reverse=True)
+                    # 兜底里可能把 faded 复活成 active（见 _pass），索引的文档数要跟上。
+                    self._sync_index_meta()
 
         self.db.commit()
         return out
@@ -913,6 +1061,9 @@ class Store:
             "UPDATE memories SET status='phantom', confidence=0.0, note=?, updated_at=? WHERE id=?",
             (reason[:200], _iso(), memory_id),
         )
+        if row["status"] == "faded":
+            self._reindex(memory_id)
+            self._sync_index_meta()
         self.db.commit()
         return {"id": memory_id, "status": "phantom", "note": "已标记为错误，不再参与检索"}
 
@@ -924,6 +1075,9 @@ class Store:
             "UPDATE memories SET status=?, importance=MAX(importance, ?) WHERE id=?",
             ("pinned" if pinned else "active", PIN_IMPORTANCE if pinned else 0.0, memory_id),
         )
+        if row["status"] == "faded":
+            self._reindex(memory_id)
+            self._sync_index_meta()
         self.db.commit()
         return {"id": memory_id, "pinned": pinned}
 
@@ -945,6 +1099,9 @@ class Store:
         self.db.executemany(
             "UPDATE memories SET status='faded' WHERE id=?", [(i,) for i in drop]
         )
+        for i in drop:
+            self._reindex(i)
+        self._sync_index_meta()
         self.db.commit()
         return len(drop)
 
@@ -956,6 +1113,8 @@ class Store:
 
     def consolidate(self) -> dict:
         """合并近重复 -> 降级 -> 上限截断 -> 物理清理。无守护进程，懒触发。"""
+        # 索引只是缓存：这里做一次完整对账，任何漏掉的增删都在下一次整理时自愈。
+        self._verify_token_index(full=True)
         report = {"merged": 0, "faded": 0, "capped": 0, "purged": 0, "promoted": 0,
                   "short_trimmed": 0}
 
@@ -1019,14 +1178,17 @@ class Store:
                 age_active = self._active_day() - (r["born_active"] or 0)
                 if age_active > SHORT_MAX_ACTIVE_DAYS:
                     self.db.execute("UPDATE memories SET status='faded' WHERE id=?", (r["id"],))
+                    self._reindex(r["id"])
                     report["faded"] += 1
                     continue
                 if _age_days(r["created_at"]) > ZOMBIE_DAYS:
                     self.db.execute("UPDATE memories SET status='faded' WHERE id=?", (r["id"],))
+                    self._reindex(r["id"])
                     report["faded"] += 1
                     continue
             if self.weight(r) < FADE_BELOW:
                 self.db.execute("UPDATE memories SET status='faded' WHERE id=?", (r["id"],))
+                self._reindex(r["id"])
                 report["faded"] += 1
 
         # F7：活跃上限。钉住的、profile、permanent 都不参与截断 —— 永久就是永久。
@@ -1039,6 +1201,7 @@ class Store:
                 if r["status"] == "pinned" or HALF_LIFE.get(r["kind"]) is None:
                     continue
                 self.db.execute("UPDATE memories SET status='faded' WHERE id=?", (r["id"],))
+                self._reindex(r["id"])
                 report["capped"] += 1
 
         # F8：短期是滚动缓冲区，超出 SHORT_MAX 条就淘汰最旧的
@@ -1048,9 +1211,12 @@ class Store:
         for r in self.db.execute("SELECT * FROM memories WHERE status='faded'"):
             ref = r["last_used_at"] or r["updated_at"]
             if _age_days(ref) > HARD_DELETE_DAYS:
+                self._index_remove(r["id"])
                 self.db.execute("DELETE FROM memories WHERE id=?", (r["id"],))
                 report["purged"] += 1
 
+        self._prune_token_df()
+        self._sync_index_meta()
         self.db.commit()
         self._set_meta("last_consolidate", str(_now()))
         return report

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -442,39 +443,163 @@ def main() -> int:
     weak = st3.recall("ThinkPad", limit=8)
     check(any(h["id"] == old for h in weak), "弱命中时兜底翻出 faded")
 
-    # ---- 回归：faded 粗筛（2026-10-27 加）----
+    # ---- 回归：faded 倒排索引（2026-10-28 换掉 LIKE 粗筛）----
     from core import tokenize as _tok
 
     calls: list[int] = []
-    _orig = st3._fetch_faded
+    _orig = st3._faded_candidates
 
     def _spy(*a, **k):
         calls.append(1)
         return _orig(*a, **k)
 
-    st3._fetch_faded = _spy
+    st3._faded_candidates = _spy
     st3.recall("", limit=6)
     check(not calls, "空查询不触发 faded 兜底")
     st3.recall("ThinkPad", limit=8)
     check(bool(calls), "非空弱查询仍会触发兜底")
-    st3._fetch_faded = _orig
+    st3._faded_candidates = _orig
 
     _q = "ThinkPad"
     _qt = _tok(_q)
     _full = st3._pass(st3._fetch(("faded",), "", ""), st3._tf(_qt), _qt, 8, "", False)
+    _rows = st3._faded_candidates(_qt, "", "")
+    _tfs = {r["id"]: st3._tf(_tok(r["text"] + " " + r["tags"])) for r in _rows}
     _pre = st3._pass(
-        st3._fetch_faded(_qt, "", ""), st3._tf(_qt), _qt, 8, "", False,
-        *st3._faded_corpus_stats(_qt),
+        _rows, st3._tf(_qt), _qt, 8, "", False,
+        *st3._faded_corpus_stats(_qt, _tfs, ""), tfs=_tfs,
     )
-    check([x["id"] for x in _full] == [x["id"] for x in _pre], "粗筛与全扫的排序结果一致")
+    # 全扫会把 rel=0 但权重高的 faded 也排进来，索引候选不含它们；只比共同条目的相关度
+    _full_rel = {x["id"]: x["relevance"] for x in _full}
+    _pre_rel = {x["id"]: x["relevance"] for x in _pre}
+    _shared = set(_full_rel) & set(_pre_rel)
+    check(
+        bool(_shared) and all(_full_rel[i] == _pre_rel[i] for i in _shared),
+        f"索引候选与全扫的相关度一致（{len(_shared)} 条共同条目）",
+    )
 
     esc = Store(str(Path(tempfile.mkdtemp()) / "esc.db"))
     esc.remember("dsh_memory 的配置放在 dsh 目录", kind="fact", importance=0.5)
     decoy = esc.remember("dshXmemory 是诱饵条目", kind="fact", importance=0.5)["id"]
     esc.db.execute("UPDATE memories SET status='faded'")
     esc.db.commit()
-    _hit_ids = [r["id"] for r in esc._fetch_faded(_tok("dsh_memory"), "", "")]
-    check(decoy not in _hit_ids, "LIKE 里的下划线被转义（不误伤 dshXmemory）")
+    esc._verify_token_index()
+    _hit_ids = [r["id"] for r in esc._faded_candidates(_tok("dsh_memory"), "", "")]
+    check(decoy not in _hit_ids, "token 精确匹配，不误伤 dshXmemory")
+
+    # rel=0 的高权重 faded 不该被兜底带出来（全扫会按权重顺带排出几条噪音）
+    noise = Store(str(Path(tempfile.mkdtemp()) / "noise.db"))
+    noise.remember("完全无关的高权重条目：周末买菜做饭打扫卫生", kind="fact", importance=0.8)
+    noise.remember("zenbookx1 的驱动版本锁定在 5.1.3", kind="fact", importance=0.5)
+    noise.db.execute("UPDATE memories SET status='faded'")
+    noise.db.commit()
+    noise._verify_token_index()
+    _noise_ids = [r["id"] for r in noise._faded_candidates(_tok("zenbookx1"), "", "")]
+    check(len(_noise_ids) == 1, f"rel=0 的高权重 faded 不进候选（实得 {len(_noise_ids)} 条）")
+
+    # ---- 回归：索引与派生数据的一致性 ----
+    print("\n── faded 倒排索引 ──")
+    idx = Store(str(Path(tempfile.mkdtemp()) / "idx.db"))
+    idx.remember("索引一致性用的长期条目，提到 MCP 与 SQLite", kind="fact", importance=0.5)
+    idx_texts = [
+        "索引测试一：MCP 协议回环能过",
+        "索引测试二：SQLite 开了 WAL 模式",
+        "索引测试三：倒排索引要统计 df",
+        "索引测试四：余弦相关度与 TF-IDF",
+        "索引测试五：老库迁移要补列",
+        "索引测试六：短期记忆按条数淘汰",
+    ]
+    faded_ids = []
+    for text in idx_texts:
+        mid = idx.remember(text, kind="fact", importance=0.4)["id"]
+        faded_ids.append(mid)
+    for mid in faded_ids:
+        idx.db.execute("UPDATE memories SET status='faded' WHERE id=?", (mid,))
+    idx.db.commit()
+    idx._verify_token_index()
+
+    brute: dict[str, int] = {}
+    for r in idx.db.execute("SELECT id,text,tags FROM memories WHERE status='faded'"):
+        for t in set(_tok(r["text"] + " " + r["tags"])):
+            brute[t] = brute.get(t, 0) + 1
+    got_df = {r["token"]: r["df"] for r in idx.db.execute("SELECT token,df FROM token_df")}
+    check(got_df == brute, f"token_df 与暴力重算一致（{len(got_df)} 个 token）")
+
+    tf_bad = []
+    for r in idx.db.execute("SELECT id,text,tags FROM memories WHERE status='faded'"):
+        want_tf = idx._tf(_tok(r["text"] + " " + r["tags"]))
+        have_tf = {
+            x["token"]: x["tf"]
+            for x in idx.db.execute(
+                "SELECT token,tf FROM mem_tokens WHERE memory_id=?", (r["id"],)
+            )
+        }
+        if want_tf != have_tf:
+            tf_bad.append(r["id"])
+    check(not tf_bad, f"mem_tokens 的 tf 与重新 tokenize 一致（坏 {len(tf_bad)} 条）")
+
+    idx.db.execute("DELETE FROM mem_tokens WHERE memory_id=?", (faded_ids[0],))
+    idx.db.commit()
+    idx._verify_token_index(full=True)
+    healed = idx.db.execute(
+        "SELECT COUNT(*) FROM mem_tokens WHERE memory_id=?", (faded_ids[0],)
+    ).fetchone()[0]
+    check(healed > 0, "索引被破坏后能自愈重建")
+
+    idx.forget(faded_ids[1])
+    gone = idx.db.execute(
+        "SELECT COUNT(*) FROM mem_tokens WHERE memory_id=?", (faded_ids[1],)
+    ).fetchone()[0]
+    check(gone == 0, "forget 掉 faded 后索引同步清掉")
+
+    idx.pin(faded_ids[2])
+    gone2 = idx.db.execute(
+        "SELECT COUNT(*) FROM mem_tokens WHERE memory_id=?", (faded_ids[2],)
+    ).fetchone()[0]
+    check(gone2 == 0, "pin 回 active 后索引同步清掉")
+
+    idx.db.execute(
+        "UPDATE memories SET status='faded', updated_at=datetime('now','-400 day'), "
+        "last_used_at=NULL WHERE id=?", (faded_ids[2],)
+    )
+    idx.db.commit()
+    idx._verify_token_index()
+    rep_idx = idx.consolidate()
+    check(
+        idx.db.execute("SELECT COUNT(*) FROM memories WHERE id=?", (faded_ids[2],)).fetchone()[0]
+        == 0 and rep_idx["purged"] >= 1,
+        "过期 faded 被物理删除",
+    )
+    gone3 = idx.db.execute(
+        "SELECT COUNT(*) FROM mem_tokens WHERE memory_id=?", (faded_ids[2],)
+    ).fetchone()[0]
+    check(gone3 == 0, "物理删除后索引同步清掉")
+
+    # ---- 回归：长查询不能漏（曾按前 8 个 token 截断，命中词在末段就丢了）----
+    lq = Store(str(Path(tempfile.mkdtemp()) / "longq.db"))
+    tgt = lq.remember("旧机器的说明书放在哪里，我记得是第三个抽屉", kind="fact", importance=0.6)["id"]
+    lq.db.execute("UPDATE memories SET status='faded' WHERE id=?", (tgt,))
+    lq.db.commit()
+    lq._verify_token_index()
+    hit = lq.recall("量子咖啡机检修记录归档放在哪里", limit=8, reinforce=False)
+    check(any(h["id"] == tgt for h in hit), "长查询（命中词在末段）仍能召回 faded")
+
+    # ---- 回归：kind 过滤时 idf/unseen 与全扫一致 ----
+    kd = Store(str(Path(tempfile.mkdtemp()) / "kinddf.db"))
+    kd.remember("alpha 缓存命中率的记录", kind="fact", importance=0.5)
+    kd.remember("alpha 缓存淘汰策略", kind="fact", importance=0.5)
+    kd.remember("alpha 也是事件但 kind 不同", kind="event", importance=0.5)
+    kd.db.execute("UPDATE memories SET status='faded'")
+    kd.db.commit()
+    kd._verify_token_index()
+    kqt = _tok("alpha 缓存")
+    krows = kd._faded_candidates(kqt, "fact", "")
+    check(all(r["kind"] == "fact" for r in krows), "kind 过滤下候选不含其他 kind")
+    ktfs = {r["id"]: kd._tf(_tok(r["text"] + " " + r["tags"])) for r in krows}
+    got_idf, got_unseen = kd._faded_corpus_stats(kqt, ktfs, "fact")
+    want_idf = kd._idf(list(ktfs.values()))
+    check(got_idf == want_idf, "kind 过滤时 idf 与全扫逐字一致")
+    check(abs(got_unseen - (math.log(3) + 1.0)) < 1e-12, "kind 过滤时 unseen 按该 kind 的池子算")
 
     # ---- 回归：兜底保底（强相关 faded 不被无关活跃条目挤掉）----
     rs = Store(str(Path(tempfile.mkdtemp()) / "rescue.db"))
@@ -483,6 +608,7 @@ def main() -> int:
     target = rs.remember("zenbookx1 的驱动版本锁定在 5.1.3", kind="fact", importance=0.5)["id"]
     rs.db.execute("UPDATE memories SET status='faded' WHERE id=?", (target,))
     rs.db.commit()
+    rs._verify_token_index()
     got = rs.recall("zenbookx1", limit=8, reinforce=False)
     check(any(h["id"] == target for h in got), "强相关的 faded 命中不会被无关活跃条目挤掉")
 
@@ -497,6 +623,7 @@ def main() -> int:
     for mid in many:
         rs2.db.execute("UPDATE memories SET status='faded' WHERE id=?", (mid,))
     rs2.db.commit()
+    rs2._verify_token_index()
     got2 = [h for h in rs2.recall("zenbookx1", limit=8, reinforce=False) if h["id"] in many]
     check(len(got2) == 2, f"保底最多放 2 条 faded（实得 {len(got2)}）")
 
